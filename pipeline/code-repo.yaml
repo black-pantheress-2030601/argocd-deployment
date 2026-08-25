@@ -1,0 +1,24 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CodePipeline with CodeBuild to deploy standalone-eks-cluster.yaml across multiple accounts.
+
+Parameters:
+  RepositoryName:
+    Type: String
+    Default: argocd-deployment
+
+Resources:
+  CodeCommitRepo:
+    Type: AWS::CodeCommit::Repository
+    Properties:
+      RepositoryName: !Ref RepositoryName
+      RepositoryDescription: ArgoCD deployment repository with EKS cluster definitions
+  
+  
+
+Outputs:
+  RepositoryCloneUrlHttp:
+    Value: !GetAtt CodeCommitRepo.CloneUrlHttp
+  RepositoryCloneUrlSsh:
+    Value: !GetAtt CodeCommitRepo.CloneUrlSsh
+  RepositoryArn:
+    Value: !GetAtt CodeCommitRepo.Arn

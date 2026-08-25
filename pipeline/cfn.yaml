@@ -1,0 +1,291 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CodePipeline with CodeBuild to deploy standalone-eks-cluster.yaml across multiple accounts.
+
+Parameters:
+  BranchName:
+    Type: String
+    Default: main
+
+  TargetAccountIds:
+    Type: CommaDelimitedList
+    Description: Target AWS account IDs to deploy EKS into
+
+  CrossAccountRoleName:
+    Type: String
+    Default: EKSDeploymentRole
+    Description: Name of the role to assume in each target account
+
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+
+  Subnet1Id:
+    Type: AWS::EC2::Subnet::Id
+
+  Subnet2Id:
+    Type: AWS::EC2::Subnet::Id
+
+  Subnet3Id:
+    Type: AWS::EC2::Subnet::Id
+
+Resources:
+
+  ArtifactBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-artifacts-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldArtifacts
+            Status: Enabled
+            ExpirationInDays: 30
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-codebuild-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AssumeTargetAccountRoles
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: sts:AssumeRole
+                Resource: !Sub "arn:${AWS::Partition}:iam::*:role/${CrossAccountRoleName}"
+                Condition:
+                  StringEquals:
+                    aws:ResourceAccount: !Ref TargetAccountIds
+        - PolicyName: Logs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-deploy-eks:*"
+        - PolicyName: ArtifactAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                Resource: !Sub "${ArtifactBucket.Arn}/*"
+
+  PipelineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-pipeline-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codepipeline.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PipelinePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:GetBucketVersioning
+                Resource:
+                  - !GetAtt ArtifactBucket.Arn
+                  - !Sub "${ArtifactBucket.Arn}/*"
+              - Effect: Allow
+                Action:
+                  - codecommit:GetBranch
+                  - codecommit:GetCommit
+                  - codecommit:UploadArchive
+                  - codecommit:GetUploadArchiveStatus
+                  - codecommit:CancelUploadArchive
+                Resource: !GetAtt CodeCommitRepo.Arn
+              - Effect: Allow
+                Action:
+                  - codebuild:StartBuild
+                  - codebuild:BatchGetBuilds
+                Resource: !GetAtt DeployProject.Arn
+
+  DeployProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: !Sub "${AWS::StackName}-deploy-eks"
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      TimeoutInMinutes: 60
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: TARGET_ACCOUNTS
+            Value: !Join [",", !Ref TargetAccountIds]
+          - Name: CROSS_ACCOUNT_ROLE
+            Value: !Ref CrossAccountRoleName
+          - Name: VPC_ID
+            Value: !Ref VpcId
+          - Name: SUBNET_1
+            Value: !Ref Subnet1Id
+          - Name: SUBNET_2
+            Value: !Ref Subnet2Id
+          - Name: SUBNET_3
+            Value: !Ref Subnet3Id
+      Source:
+        Type: CODEPIPELINE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - aws cloudformation validate-template --template-body file://standalone-eks-cluster.yaml
+            build:
+              commands:
+                - |
+                  IFS=',' read -ra ACCOUNTS <<< "$TARGET_ACCOUNTS"
+                  FAILED=0
+                  for ACCOUNT_ID in "${ACCOUNTS[@]}"; do
+                    echo ">>> Deploying to account $ACCOUNT_ID"
+
+                    CREDS=$(aws sts assume-role \
+                      --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/${CROSS_ACCOUNT_ROLE}" \
+                      --role-session-name "eks-pipeline-${CODEBUILD_BUILD_NUMBER}" \
+                      --duration-seconds 3600 \
+                      --output json)
+
+                    export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.Credentials.AccessKeyId')
+                    export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.Credentials.SecretAccessKey')
+                    export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r '.Credentials.SessionToken')
+
+                    aws cloudformation deploy \
+                      --template-file standalone-eks-cluster.yaml \
+                      --stack-name standalone-eks-cluster \
+                      --capabilities CAPABILITY_NAMED_IAM \
+                      --parameter-overrides \
+                        ClusterName=standalone-cluster \
+                        VpcId=$VPC_ID \
+                        Subnet1Id=$SUBNET_1 \
+                        Subnet2Id=$SUBNET_2 \
+                        Subnet3Id=$SUBNET_3 \
+                      --no-fail-on-empty-changeset || FAILED=1
+
+                    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+
+                    if [ $FAILED -eq 1 ]; then
+                      echo "!!! Deployment failed for account $ACCOUNT_ID"
+                      exit 1
+                    fi
+
+                    echo ">>> Account $ACCOUNT_ID complete"
+                  done
+      Artifacts:
+        Type: CODEPIPELINE
+
+  Pipeline:
+    Type: AWS::CodePipeline::Pipeline
+    Properties:
+      Name: !Sub "${AWS::StackName}-pipeline"
+      RoleArn: !GetAtt PipelineRole.Arn
+      ArtifactStore:
+        Type: S3
+        Location: !Ref ArtifactBucket
+      Stages:
+        - Name: Source
+          Actions:
+            - Name: CodeCommitSource
+              ActionTypeId:
+                Category: Source
+                Owner: AWS
+                Provider: CodeCommit
+                Version: "1"
+              Configuration:
+                RepositoryName: !Ref RepositoryName
+                BranchName: !Ref BranchName
+                PollForSourceChanges: false
+              OutputArtifacts:
+                - Name: SourceOutput
+        - Name: Deploy
+          Actions:
+            - Name: DeployEKSClusters
+              ActionTypeId:
+                Category: Build
+                Owner: AWS
+                Provider: CodeBuild
+                Version: "1"
+              Configuration:
+                ProjectName: !Ref DeployProject
+              InputArtifacts:
+                - Name: SourceOutput
+
+  SourceEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger pipeline on push to branch
+      EventPattern:
+        source:
+          - aws.codecommit
+        detail-type:
+          - CodeCommit Repository State Change
+        resources:
+          - !GetAtt CodeCommitRepo.Arn
+        detail:
+          event:
+            - referenceCreated
+            - referenceUpdated
+          referenceType:
+            - branch
+          referenceName:
+            - !Ref BranchName
+      Targets:
+        - Arn: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}"
+          Id: TriggerPipeline
+          RoleArn: !GetAtt EventBridgeRole.Arn
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-eventbridge-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StartPipeline
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codepipeline:StartPipelineExecution
+                Resource: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}"
+
+Outputs:
+  PipelineUrl:
+    Value: !Sub "https://${AWS::Region}.console.aws.amazon.com/codesuite/codepipeline/pipelines/${Pipeline}/view"
+  CodeBuildRoleArn:
+    Value: !GetAtt CodeBuildRole.Arn
+    Description: Provide this ARN to the target account role trust policy

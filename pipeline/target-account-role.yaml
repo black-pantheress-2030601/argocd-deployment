@@ -1,0 +1,92 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Minimal-scoped cross-account role for EKS deployment from the pipeline account.
+
+Parameters:
+  PipelineAccountId:
+    Type: String
+    Description: AWS account ID where the CodePipeline runs
+
+  PipelineRoleName:
+    Type: String
+    Default: eks-pipeline-codebuild-role
+    Description: Name of the CodeBuild role in the pipeline account
+
+Resources:
+
+  EKSDeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: EKSDeploymentRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${PipelineAccountId}:role/${PipelineRoleName}"
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: eks-pipeline
+      Policies:
+        - PolicyName: CloudFormationDeploy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:CreateStack
+                  - cloudformation:UpdateStack
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                  - cloudformation:DescribeStackEvents
+                  - cloudformation:GetTemplate
+                  - cloudformation:CreateChangeSet
+                  - cloudformation:DescribeChangeSet
+                  - cloudformation:ExecuteChangeSet
+                  - cloudformation:DeleteChangeSet
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/standalone-eks-cluster/*"
+        - PolicyName: EKSManagement
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:CreateCluster
+                  - eks:DeleteCluster
+                  - eks:DescribeCluster
+                  - eks:TagResource
+                  - eks:UntagResource
+                  - eks:UpdateClusterConfig
+                  - eks:UpdateClusterVersion
+                  - eks:CreateNodegroup
+                  - eks:DeleteNodegroup
+                  - eks:DescribeNodegroup
+                  - eks:UpdateNodegroupConfig
+                  - eks:UpdateNodegroupVersion
+                Resource:
+                  - !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/standalone-cluster"
+                  - !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:nodegroup/standalone-cluster/*/*"
+        - PolicyName: IAMRoleManagement
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:CreateRole
+                  - iam:DeleteRole
+                  - iam:GetRole
+                  - iam:PutRolePolicy
+                  - iam:DeleteRolePolicy
+                  - iam:AttachRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:PassRole
+                  - iam:TagRole
+                  - iam:UntagRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/standalone-cluster-cluster-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/standalone-cluster-node-role"
+
+Outputs:
+  RoleArn:
+    Value: !GetAtt EKSDeploymentRole.Arn
+    Description: ARN of the deployment role for the pipeline to assume
