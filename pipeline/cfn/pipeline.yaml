@@ -1,31 +1,47 @@
 AWSTemplateFormatVersion: "2010-09-09"
-Description: CodePipeline with CodeBuild to deploy standalone-eks-cluster.yaml across multiple accounts.
+Description: CodePipeline with CodeBuild to deploy standalone-eks-cluster.yaml across multiple accounts per environment branch.
 
 Parameters:
-  BranchName:
+  RepositoryName:
     Type: String
-    Default: main
+    Default: argocd-deployment
+    Description: Name of the CodeCommit repo (deployed separately via code-repo.yaml)
+
+  Environment:
+    Type: String
+    AllowedValues:
+      - integration
+      - test-platform
+      - main
+    Description: Environment/branch to deploy from
 
   TargetAccountIds:
     Type: CommaDelimitedList
-    Description: Target AWS account IDs to deploy EKS into
+    Description: Target AWS account IDs for this environment
 
   CrossAccountRoleName:
     Type: String
     Default: EKSDeploymentRole
     Description: Name of the role to assume in each target account
 
-  VpcId:
-    Type: AWS::EC2::VPC::Id
+  SsmVpcIdKey:
+    Type: String
+    Default: /network/vpc-id
+    Description: SSM parameter key in target accounts for VPC ID
 
-  Subnet1Id:
-    Type: AWS::EC2::Subnet::Id
+  SsmSubnetIdsKey:
+    Type: String
+    Default: /network/subnet-ids
+    Description: SSM parameter key in target accounts for comma-separated subnet IDs
 
-  Subnet2Id:
-    Type: AWS::EC2::Subnet::Id
-
-  Subnet3Id:
-    Type: AWS::EC2::Subnet::Id
+Mappings:
+  BranchMap:
+    integration:
+      Branch: integration
+    test-platform:
+      Branch: test-platform
+    main:
+      Branch: main
 
 Resources:
 
@@ -123,7 +139,7 @@ Resources:
                   - codecommit:UploadArchive
                   - codecommit:GetUploadArchiveStatus
                   - codecommit:CancelUploadArchive
-                Resource: !GetAtt CodeCommitRepo.Arn
+                Resource: !Sub "arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}"
               - Effect: Allow
                 Action:
                   - codebuild:StartBuild
@@ -145,14 +161,12 @@ Resources:
             Value: !Join [",", !Ref TargetAccountIds]
           - Name: CROSS_ACCOUNT_ROLE
             Value: !Ref CrossAccountRoleName
-          - Name: VPC_ID
-            Value: !Ref VpcId
-          - Name: SUBNET_1
-            Value: !Ref Subnet1Id
-          - Name: SUBNET_2
-            Value: !Ref Subnet2Id
-          - Name: SUBNET_3
-            Value: !Ref Subnet3Id
+          - Name: ENVIRONMENT
+            Value: !Ref Environment
+          - Name: SSM_VPC_ID_KEY
+            Value: !Ref SsmVpcIdKey
+          - Name: SSM_SUBNET_IDS_KEY
+            Value: !Ref SsmSubnetIdsKey
       Source:
         Type: CODEPIPELINE
         BuildSpec: |
@@ -160,46 +174,12 @@ Resources:
           phases:
             install:
               commands:
+                - pip install yq
                 - aws cloudformation validate-template --template-body file://standalone-eks-cluster.yaml
             build:
               commands:
-                - |
-                  IFS=',' read -ra ACCOUNTS <<< "$TARGET_ACCOUNTS"
-                  FAILED=0
-                  for ACCOUNT_ID in "${ACCOUNTS[@]}"; do
-                    echo ">>> Deploying to account $ACCOUNT_ID"
-
-                    CREDS=$(aws sts assume-role \
-                      --role-arn "arn:aws:iam::${ACCOUNT_ID}:role/${CROSS_ACCOUNT_ROLE}" \
-                      --role-session-name "eks-pipeline-${CODEBUILD_BUILD_NUMBER}" \
-                      --duration-seconds 3600 \
-                      --output json)
-
-                    export AWS_ACCESS_KEY_ID=$(echo $CREDS | jq -r '.Credentials.AccessKeyId')
-                    export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | jq -r '.Credentials.SecretAccessKey')
-                    export AWS_SESSION_TOKEN=$(echo $CREDS | jq -r '.Credentials.SessionToken')
-
-                    aws cloudformation deploy \
-                      --template-file standalone-eks-cluster.yaml \
-                      --stack-name standalone-eks-cluster \
-                      --capabilities CAPABILITY_NAMED_IAM \
-                      --parameter-overrides \
-                        ClusterName=standalone-cluster \
-                        VpcId=$VPC_ID \
-                        Subnet1Id=$SUBNET_1 \
-                        Subnet2Id=$SUBNET_2 \
-                        Subnet3Id=$SUBNET_3 \
-                      --no-fail-on-empty-changeset || FAILED=1
-
-                    unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
-
-                    if [ $FAILED -eq 1 ]; then
-                      echo "!!! Deployment failed for account $ACCOUNT_ID"
-                      exit 1
-                    fi
-
-                    echo ">>> Account $ACCOUNT_ID complete"
-                  done
+                - chmod +x pipeline/scripts/deploy-eks.sh
+                - ./pipeline/scripts/deploy-eks.sh
       Artifacts:
         Type: CODEPIPELINE
 
@@ -222,7 +202,7 @@ Resources:
                 Version: "1"
               Configuration:
                 RepositoryName: !Ref RepositoryName
-                BranchName: !Ref BranchName
+                BranchName: !FindInMap [BranchMap, !Ref Environment, Branch]
                 PollForSourceChanges: false
               OutputArtifacts:
                 - Name: SourceOutput
@@ -242,14 +222,14 @@ Resources:
   SourceEventRule:
     Type: AWS::Events::Rule
     Properties:
-      Description: Trigger pipeline on push to branch
+      Description: !Sub "Trigger ${Environment} pipeline on branch push"
       EventPattern:
         source:
           - aws.codecommit
         detail-type:
           - CodeCommit Repository State Change
         resources:
-          - !GetAtt CodeCommitRepo.Arn
+          - !Sub "arn:${AWS::Partition}:codecommit:${AWS::Region}:${AWS::AccountId}:${RepositoryName}"
         detail:
           event:
             - referenceCreated
@@ -257,7 +237,7 @@ Resources:
           referenceType:
             - branch
           referenceName:
-            - !Ref BranchName
+            - !FindInMap [BranchMap, !Ref Environment, Branch]
       Targets:
         - Arn: !Sub "arn:${AWS::Partition}:codepipeline:${AWS::Region}:${AWS::AccountId}:${Pipeline}"
           Id: TriggerPipeline
@@ -289,3 +269,7 @@ Outputs:
   CodeBuildRoleArn:
     Value: !GetAtt CodeBuildRole.Arn
     Description: Provide this ARN to the target account role trust policy
+  Environment:
+    Value: !Ref Environment
+  BranchName:
+    Value: !FindInMap [BranchMap, !Ref Environment, Branch]

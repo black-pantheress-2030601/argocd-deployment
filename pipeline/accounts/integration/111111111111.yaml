@@ -1,0 +1,4 @@
+NodeInstanceType: t3.medium
+NodeDesiredSize: 2
+NodeMinSize: 1
+NodeMaxSize: 3

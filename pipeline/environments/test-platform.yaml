@@ -1,0 +1,5 @@
+Environment: test-platform
+RepositoryName: argocd-deployment
+CrossAccountRoleName: EKSDeploymentRole
+SsmVpcIdKey: /network/vpc-id
+SsmSubnetIdsKey: /network/subnet-ids

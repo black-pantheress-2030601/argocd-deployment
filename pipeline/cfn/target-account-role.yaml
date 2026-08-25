@@ -12,7 +12,6 @@ Parameters:
     Description: Name of the CodeBuild role in the pipeline account
 
 Resources:
-
   EKSDeploymentRole:
     Type: AWS::IAM::Role
     Properties:
@@ -64,8 +63,17 @@ Resources:
                   - eks:UpdateNodegroupConfig
                   - eks:UpdateNodegroupVersion
                 Resource:
-                  - !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/standalone-cluster"
-                  - !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:nodegroup/standalone-cluster/*/*"
+                  - !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/*"
+                  - !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:nodegroup/*"
+        - PolicyName: SSMParameterRead
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource:
+                  - !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/network/*"
         - PolicyName: IAMRoleManagement
           PolicyDocument:
             Version: "2012-10-17"
@@ -83,8 +91,8 @@ Resources:
                   - iam:TagRole
                   - iam:UntagRole
                 Resource:
-                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/standalone-cluster-cluster-role"
-                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/standalone-cluster-node-role"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/*"
 
 Outputs:
   RoleArn:

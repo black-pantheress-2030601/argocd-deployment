@@ -1,0 +1,4 @@
+NodeInstanceType: t3.large
+NodeDesiredSize: 3
+NodeMinSize: 2
+NodeMaxSize: 5

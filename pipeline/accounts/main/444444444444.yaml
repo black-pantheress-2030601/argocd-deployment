@@ -1,0 +1,4 @@
+NodeInstanceType: m5.xlarge
+NodeDesiredSize: 3
+NodeMinSize: 3
+NodeMaxSize: 10

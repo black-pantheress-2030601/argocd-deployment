@@ -12,8 +12,6 @@ Resources:
     Properties:
       RepositoryName: !Ref RepositoryName
       RepositoryDescription: ArgoCD deployment repository with EKS cluster definitions
-  
-  
 
 Outputs:
   RepositoryCloneUrlHttp:
