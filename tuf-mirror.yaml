@@ -1,0 +1,497 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Mirrors the Bottlerocket TUF update repo (updates.bottlerocket.aws) into S3.
+  A CodeBuild project (Python + python-tuf, no Rust) verifies the full TUF chain
+  from a trusted root, copies new targets (hash and length checked), and uploads
+  timestamp.json last. An EventBridge rule runs it on a schedule.
+
+Parameters:
+  MirrorBucketName:
+    Type: String
+    Description: Name of the S3 bucket to create for the mirror.
+  Mirrors:
+    Type: String
+    Default: aws-k8s-1.31/x86_64
+    Description: Space-separated <variant>/<arch> pairs, e.g. "aws-k8s-1.31/x86_64 aws-k8s-1.31/aarch64".
+  RootJsonSha512:
+    Type: String
+    AllowedPattern: "^[0-9a-fA-F]{128}$"
+    Description: >
+      Expected SHA-512 of https://cache.bottlerocket.aws/root.json, copied from the
+      Bottlerocket documentation. The build fails if it does not match.
+  TargetRegex:
+    Type: String
+    Default: "."
+    Description: >
+      Extended regex matched against target file names. "." mirrors everything.
+      Do not prune migrations needed by your upgrade path.
+  TufPipSpec:
+    Type: String
+    Default: "tuf>=7,<8"
+    Description: pip requirement for python-tuf. Pin an exact version (e.g. tuf==7.0.1) for reproducible builds.
+  MinTimestampHoursRemaining:
+    Type: Number
+    Default: 6
+    Description: Fail the build (so you get alerted) if the mirrored timestamp.json has fewer hours than this left.
+  ScheduleExpression:
+    Type: String
+    Default: cron(0 17 * * ? *)
+    Description: EventBridge schedule (UTC). Default is daily at 17:00 UTC.
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Optional email address for build failure notifications.
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Resources:
+  MirrorBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Ref MirrorBucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+
+  BuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /codebuild/bottlerocket-tuf-mirror
+      RetentionInDays: 30
+
+  BuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: codebuild.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: mirror
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt MirrorBucket.Arn
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub "${MirrorBucket.Arn}/*"
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${BuildLogGroup.Arn}:*"
+
+  MirrorProject:
+    Type: AWS::CodeBuild::Project
+    Properties:
+      Name: bottlerocket-tuf-mirror
+      ServiceRole: !GetAtt BuildRole.Arn
+      TimeoutInMinutes: 480   # the first run backfills every target in the repo
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_MEDIUM
+        Image: aws/codebuild/standard:7.0
+        EnvironmentVariables:
+          - { Name: BUCKET, Value: !Ref MirrorBucket }
+          - { Name: MIRRORS, Value: !Ref Mirrors }
+          - { Name: ROOT_SHA512, Value: !Ref RootJsonSha512 }
+          - { Name: TARGET_REGEX, Value: !Ref TargetRegex }
+          - { Name: TUF_PIP_SPEC, Value: !Ref TufPipSpec }
+          - { Name: MIN_HOURS, Value: !Ref MinTimestampHoursRemaining }
+          - { Name: UPSTREAM, Value: "https://updates.bottlerocket.aws" }
+          - { Name: ROOT_FILE, Value: "root.json" }
+      LogsConfig:
+        CloudWatchLogs:
+          Status: ENABLED
+          GroupName: !Ref BuildLogGroup
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+          phases:
+            install:
+              runtime-versions:
+                python: "3.12"
+              commands:
+                - pip install --quiet "$TUF_PIP_SPEC" boto3 requests
+            build:
+              commands:
+                - |
+                  set -euo pipefail
+                  # Trust anchor: fetch, then verify against the hash you supplied
+                  curl -fsS https://cache.bottlerocket.aws/root.json -o root.json
+                  echo "${ROOT_SHA512}  root.json" | sha512sum -c -
+                  cat > mirror.py <<'PYEOF'
+                  #!/usr/bin/env python3
+                  """Mirror a TUF repository (Bottlerocket's updates.bottlerocket.aws) to S3.
+
+                  Everything uploaded is the exact bytes upstream served, and only after
+                  python-tuf has verified the full chain (root -> timestamp -> snapshot -> targets)
+                  from the trusted root you supply. Target files are checked against the hash and
+                  length in the verified targets metadata before they are uploaded.
+
+                  Upload order: targets, root chain, snapshot, targets metadata, timestamp.json last,
+                  so a client never sees metadata that refers to files not yet present.
+
+                  Config (environment):
+                    UPSTREAM        base URL                      (default https://updates.bottlerocket.aws)
+                    METADATA_PREFIX date-based repo prefix        (default 2020-07-07)
+                    MIRRORS         space-separated variant/arch  (e.g. "aws-k8s-1.31/x86_64")
+                    ROOT_FILE       path to the trusted root.json (default root.json)
+                    BUCKET          destination S3 bucket
+                    DEST_DIR        destination directory instead of S3 (for local testing)
+                    TARGET_REGEX    only mirror target names matching this regex (default ".")
+                    MIN_HOURS       fail if the mirrored timestamp.json has less than this left (default 6)
+                  """
+                  import hashlib
+                  import os
+                  import re
+                  import shutil
+                  import sys
+                  import tempfile
+                  import traceback
+                  from datetime import datetime, timezone
+
+                  import requests
+                  from requests.adapters import HTTPAdapter
+                  from urllib3.util.retry import Retry
+
+                  from tuf.api.metadata import Metadata, Root, Snapshot, Targets, Timestamp
+                  from tuf.ngclient import Updater
+
+                  IMMUTABLE = "public,max-age=31536000,immutable"
+                  SHORT = "public,max-age=60"
+                  JSON = "application/json"
+
+                  UPSTREAM = os.environ.get("UPSTREAM", "https://updates.bottlerocket.aws").rstrip("/")
+                  PREFIX = os.environ.get("METADATA_PREFIX", "2020-07-07")
+                  MIRRORS = os.environ.get("MIRRORS", "").split()
+                  ROOT_FILE = os.environ.get("ROOT_FILE", "root.json")
+                  TARGET_REGEX = re.compile(os.environ.get("TARGET_REGEX", "."))
+                  MIN_HOURS = float(os.environ.get("MIN_HOURS", "6"))
+
+
+                  def log(msg):
+                      print(msg, flush=True)
+
+
+                  # --------------------------------------------------------------------------- storage
+                  class S3Store:
+                      def __init__(self, bucket):
+                          import boto3
+                          from botocore.exceptions import ClientError
+
+                          self.s3 = boto3.client("s3")
+                          self.bucket = bucket
+                          self._client_error = ClientError
+
+                      def exists(self, key):
+                          try:
+                              self.s3.head_object(Bucket=self.bucket, Key=key)
+                              return True
+                          except self._client_error as e:
+                              if e.response["Error"]["Code"] in ("404", "NoSuchKey", "NotFound"):
+                                  return False
+                              raise
+
+                      def put_file(self, key, path, cache, ctype=None):
+                          extra = {"CacheControl": cache}
+                          if ctype:
+                              extra["ContentType"] = ctype
+                          self.s3.upload_file(path, self.bucket, key, ExtraArgs=extra)
+
+                      def put_bytes(self, key, data, cache, ctype=None):
+                          extra = {"CacheControl": cache}
+                          if ctype:
+                              extra["ContentType"] = ctype
+                          self.s3.put_object(Bucket=self.bucket, Key=key, Body=data, **extra)
+
+
+                  class DirStore:
+                      """Local directory backend, used for testing."""
+
+                      def __init__(self, root):
+                          self.root = root
+
+                      def _p(self, key):
+                          p = os.path.join(self.root, key)
+                          os.makedirs(os.path.dirname(p), exist_ok=True)
+                          return p
+
+                      def exists(self, key):
+                          return os.path.exists(os.path.join(self.root, key))
+
+                      def put_file(self, key, path, cache, ctype=None):
+                          shutil.copyfile(path, self._p(key))
+
+                      def put_bytes(self, key, data, cache, ctype=None):
+                          with open(self._p(key), "wb") as f:
+                              f.write(data)
+
+
+                  def make_store():
+                      if os.environ.get("DEST_DIR"):
+                          return DirStore(os.environ["DEST_DIR"])
+                      return S3Store(os.environ["BUCKET"])
+
+
+                  # --------------------------------------------------------------------------- http
+                  def make_session():
+                      s = requests.Session()
+                      retry = Retry(total=5, backoff_factor=1, status_forcelist=(500, 502, 503, 504))
+                      s.mount("http://", HTTPAdapter(max_retries=retry))
+                      s.mount("https://", HTTPAdapter(max_retries=retry))
+                      return s
+
+
+                  SESSION = make_session()
+
+
+                  def fetch(url):
+                      """Return the body, or None on 404."""
+                      r = SESSION.get(url, timeout=(10, 60))
+                      if r.status_code == 404:
+                          return None
+                      r.raise_for_status()
+                      return r.content
+
+
+                  # --------------------------------------------------------------------------- root chain
+                  def fetch_root_chain(base, anchor_bytes):
+                      """Fetch and verify every N.root.json from the trust anchor's version upward.
+
+                      Returns {version: raw_bytes}, and the final verified Root metadata.
+                      """
+                      anchor = Metadata[Root].from_bytes(anchor_bytes)
+                      cur = anchor
+                      v = anchor.signed.version
+                      roots = {}
+
+                      raw = fetch(f"{base}{v}.root.json")
+                      if raw is None:
+                          roots[v] = anchor_bytes  # upstream doesn't serve the anchor's own version
+                      else:
+                          same = Metadata[Root].from_bytes(raw)
+                          if same.signed.to_dict() != anchor.signed.to_dict():
+                              raise RuntimeError(f"{v}.root.json differs from the trusted root you supplied")
+                          roots[v] = raw
+
+                      while True:
+                          raw = fetch(f"{base}{cur.signed.version + 1}.root.json")
+                          if raw is None:
+                              break
+                          new = Metadata[Root].from_bytes(raw)
+                          cur.verify_delegate(Root.type, new)  # signed by the previous root's keys
+                          new.verify_delegate(Root.type, new)  # and by its own keys
+                          if new.signed.version != cur.signed.version + 1:
+                              raise RuntimeError("root version did not increase by exactly 1")
+                          roots[new.signed.version] = raw
+                          cur = new
+                      return roots, cur
+
+
+                  # --------------------------------------------------------------------------- targets
+                  def target_key(name, sha256):
+                      d, b = os.path.split(name)
+                      return "targets/" + (d + "/" if d else "") + f"{sha256}.{b}"
+
+
+                  def copy_target(store, name, tf, seen):
+                      sha = tf.hashes.get("sha256")
+                      if not sha:
+                          raise RuntimeError(f"target {name} has no sha256 hash in verified metadata")
+                      key = target_key(name, sha)
+                      if key in seen or store.exists(key):
+                          seen.add(key)
+                          return False
+                      log(f"  fetching {name} ({tf.length} bytes)")
+                      h, size = hashlib.sha256(), 0
+                      with tempfile.NamedTemporaryFile(delete=False) as tmp:
+                          try:
+                              with SESSION.get(f"{UPSTREAM}/{key}", stream=True, timeout=(10, 120)) as r:
+                                  r.raise_for_status()
+                                  for chunk in r.iter_content(1 << 20):
+                                      h.update(chunk)
+                                      size += len(chunk)
+                                      tmp.write(chunk)
+                              tmp.close()
+                              if h.hexdigest() != sha or size != tf.length:
+                                  raise RuntimeError(f"{name}: hash/length mismatch against verified metadata")
+                              store.put_file(key, tmp.name, IMMUTABLE)
+                          finally:
+                              tmp.close()
+                              os.unlink(tmp.name)
+                      seen.add(key)
+                      return True
+
+
+                  # --------------------------------------------------------------------------- one mirror
+                  def mirror_one(store, mirror, anchor_bytes, seen):
+                      prefix = f"{PREFIX}/{mirror}"
+                      base = f"{UPSTREAM}/{prefix}/"
+                      log(f"=== {mirror} ({base})")
+
+                      with tempfile.TemporaryDirectory() as work:
+                          meta_dir = os.path.join(work, "meta")
+                          os.makedirs(meta_dir)
+                          with open(os.path.join(meta_dir, "root.json"), "wb") as f:
+                              f.write(anchor_bytes)
+
+                          # 1. Full TUF verification. Persists the exact verified bytes in meta_dir.
+                          Updater(metadata_dir=meta_dir, metadata_base_url=base, bootstrap=anchor_bytes).refresh()
+
+                          def read(role):
+                              p = os.path.join(meta_dir, f"{role}.json")
+                              with open(p, "rb") as f:
+                                  return f.read()
+
+                          ts_raw, snap_raw, tgt_raw = read("timestamp"), read("snapshot"), read("targets")
+                          ts = Metadata[Timestamp].from_bytes(ts_raw)
+                          snap = Metadata[Snapshot].from_bytes(snap_raw)
+                          tgt = Metadata[Targets].from_bytes(tgt_raw)
+
+                          if set(snap.signed.meta) != {"targets.json"} or tgt.signed.delegations is not None:
+                              raise RuntimeError("repo uses delegated roles; this script mirrors top-level targets only")
+
+                          # 2. Root chain (raw upstream bytes, each link verified), tied to what the Updater accepted
+                          roots, final_root = fetch_root_chain(base, anchor_bytes)
+                          verified_root = Metadata[Root].from_bytes(read("root"))
+                          if final_root.signed.to_dict() != verified_root.signed.to_dict():
+                              raise RuntimeError("root chain does not end at the root python-tuf verified")
+
+                          # 3. Targets first
+                          copied = skipped = 0
+                          for name, tf in tgt.signed.targets.items():
+                              if not TARGET_REGEX.search(name):
+                                  continue
+                              if copy_target(store, name, tf, seen):
+                                  copied += 1
+                              else:
+                                  skipped += 1
+                          log(f"  targets: {copied} copied, {skipped} already present")
+
+                          # 4. Metadata: immutable versioned files, then timestamp.json last
+                          for ver, raw in sorted(roots.items()):
+                              store.put_bytes(f"{prefix}/{ver}.root.json", raw, IMMUTABLE, JSON)
+                          store.put_bytes(f"{prefix}/{snap.signed.version}.snapshot.json", snap_raw, IMMUTABLE, JSON)
+                          store.put_bytes(f"{prefix}/{tgt.signed.version}.targets.json", tgt_raw, IMMUTABLE, JSON)
+                          store.put_bytes(f"{prefix}/timestamp.json", ts_raw, SHORT, JSON)
+
+                          # 5. Freshness
+                          left = (ts.signed.expires - datetime.now(timezone.utc)).total_seconds() / 3600
+                          log(f"  timestamp v{ts.signed.version} expires {ts.signed.expires.isoformat()} ({left:.1f}h left)")
+                          if left < MIN_HOURS:
+                              raise RuntimeError(f"mirrored timestamp.json has only {left:.1f}h left (< {MIN_HOURS}h)")
+
+
+                  def main():
+                      if not MIRRORS:
+                          sys.exit("MIRRORS is empty")
+                      with open(ROOT_FILE, "rb") as f:
+                          anchor_bytes = f.read()
+                      store = make_store()
+                      seen, failed = set(), []
+                      for m in MIRRORS:
+                          try:
+                              mirror_one(store, m, anchor_bytes, seen)
+                          except Exception:
+                              traceback.print_exc()
+                              failed.append(m)
+                      if failed:
+                          log(f"FAILED: {', '.join(failed)}")
+                          sys.exit(1)
+                      log("OK")
+
+
+                  if __name__ == "__main__":
+                      main()
+                  PYEOF
+                  python mirror.py
+
+  EventsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !GetAtt MirrorProject.Arn
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Scheduled run of the Bottlerocket TUF mirror build
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Id: start-mirror-build
+          Arn: !GetAtt MirrorProject.Arn
+          RoleArn: !GetAtt EventsRole.Arn
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription: !If
+        - HasAlertEmail
+        - [{ Protocol: email, Endpoint: !Ref AlertEmail }]
+        - !Ref AWS::NoValue
+
+  AlertTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref AlertTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: events.amazonaws.com }
+            Action: sns:Publish
+            Resource: !Ref AlertTopic
+
+  FailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Notify when the mirror build fails
+      EventPattern:
+        source: [aws.codebuild]
+        detail-type: [CodeBuild Build State Change]
+        detail:
+          project-name: [!Ref MirrorProject]
+          build-status: [FAILED, STOPPED, FAULT, TIMED_OUT]
+      Targets:
+        - Id: sns
+          Arn: !Ref AlertTopic
+
+Outputs:
+  BucketName:
+    Value: !Ref MirrorBucket
+  ProjectName:
+    Value: !Ref MirrorProject
+  MetadataBaseUrlExample:
+    Value: !Sub "https://${MirrorBucket}.s3.${AWS::Region}.amazonaws.com/2020-07-07/<variant>/<arch>/"
+  TargetsBaseUrl:
+    Value: !Sub "https://${MirrorBucket}.s3.${AWS::Region}.amazonaws.com/targets/"
