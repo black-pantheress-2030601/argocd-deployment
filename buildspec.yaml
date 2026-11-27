@@ -1,0 +1,9 @@
+version: 0.2
+env:
+  variables:
+    S3_URI: "s3://<bucket>/tools/"
+    # S3_SSE: "aws:kms"
+phases:
+  build:
+    commands:
+      - bash build.sh
