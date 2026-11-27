@@ -1,0 +1,81 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: CodeArtifact domain with Cargo proxy of crates.io, restricted to /eks-service-catalog/ roles
+
+Parameters:
+  DomainName:
+    Type: String
+    Default: platform
+  OrganizationId:
+    Type: String
+    Description: AWS Organizations ID (o-xxxxxxxxxx) to bound cross-account access
+    AllowedPattern: "^o-[a-z0-9]{10,32}$"
+
+Resources:
+  Domain:
+    Type: AWS::CodeArtifact::Domain
+    Properties:
+      DomainName: !Ref DomainName
+      PermissionsPolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEksServiceCatalogRolesDomainAccess
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - codeartifact:GetAuthorizationToken
+              - codeartifact:DescribeDomain
+              - codeartifact:ListRepositoriesInDomain
+              - codeartifact:GetDomainPermissionsPolicy
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+              ArnLike:
+                aws:PrincipalArn: "arn:aws:iam::*:role/eks-service-catalog/*"
+
+  # Pull-through cache: only repo with the external connection
+  CratesStoreRepo:
+    Type: AWS::CodeArtifact::Repository
+    Properties:
+      DomainName: !GetAtt Domain.Name
+      RepositoryName: crates-io-store
+      Description: Proxy/cache of crates.io
+      ExternalConnections:
+        - public:crates-io
+
+  # Consumer-facing repo; also able to hold private crates
+  CargoRepo:
+    Type: AWS::CodeArtifact::Repository
+    Properties:
+      DomainName: !GetAtt Domain.Name
+      RepositoryName: cargo
+      Description: Cargo repo, upstream crates.io via crates-io-store
+      Upstreams:
+        - !GetAtt CratesStoreRepo.Name
+      PermissionsPolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowEksServiceCatalogRolesRead
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - codeartifact:DescribeRepository
+              - codeartifact:GetRepositoryEndpoint
+              - codeartifact:ListPackages
+              - codeartifact:ListPackageVersions
+              - codeartifact:DescribePackageVersion
+              - codeartifact:ReadFromRepository
+            Resource: "*"
+            Condition:
+              StringEquals:
+                aws:PrincipalOrgID: !Ref OrganizationId
+              ArnLike:
+                aws:PrincipalArn: "arn:aws:iam::*:role/eks-service-catalog/*"
+
+Outputs:
+  DomainArn:
+    Value: !GetAtt Domain.Arn
+  CargoRepoArn:
+    Value: !GetAtt CargoRepo.Arn
